@@ -1,0 +1,18 @@
+[project]
+name = "dspy-temporal-react-agent"
+version = "0.1.0"
+description = "DSPy ReAct agent orchestrated with Temporal workflows and activities"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "dspy-ai>=2.6.0",
+  "temporalio>=1.8.0",
+  "python-dotenv>=1.0.1",
+  "dspy>=3.1.3",
+  "pydantic>=2.7.0",
+  "httpx>=0.27.0",
+]
+
+[project.scripts]
+react-worker = "dspy_temporal_react.worker:main"
+react-run = "dspy_temporal_react.client:main"
