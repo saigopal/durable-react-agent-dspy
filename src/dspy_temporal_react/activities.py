@@ -5,6 +5,7 @@ import json
 import logging
 import os
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -21,6 +22,8 @@ from temporalio.common import RawValue
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
+MAX_OBSERVATION_CHARS = int(os.getenv("MAX_OBSERVATION_CHARS", "1200"))
+FINISH_TOOL_NAME = "finish"
 
 
 def _build_lm() -> dspy.LM:
@@ -48,13 +51,54 @@ async def finish() -> str:
 
 TOOL_REGISTRY = {
     "get_ip_address": get_ip_address,
-    "finish": finish,
+    FINISH_TOOL_NAME: finish,
 }
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    name: str
+    description: str
+    args: dict[str, Any]
+    examples: list[dict[str, Any]]
+
+
+TOOL_SPECS: dict[str, ToolSpec] = {
+    "get_ip_address": ToolSpec(
+        name="get_ip_address",
+        description="Get the machine public IP address.",
+        args={},
+        examples=[{}],
+    ),
+    FINISH_TOOL_NAME: ToolSpec(
+        name=FINISH_TOOL_NAME,
+        description="Stop tool execution and finalize the answer.",
+        args={},
+        examples=[{}],
+    ),
+}
+
+
+def _registry_with_finish() -> dict[str, Any]:
+    registry = dict(TOOL_REGISTRY)
+    registry[FINISH_TOOL_NAME] = finish
+    return registry
+
+
+def _tool_specs_with_finish() -> dict[str, ToolSpec]:
+    specs = dict(TOOL_SPECS)
+    specs[FINISH_TOOL_NAME] = ToolSpec(
+        name=FINISH_TOOL_NAME,
+        description="Stop tool execution and finalize the answer.",
+        args={},
+        examples=[{}],
+    )
+    return specs
 
 
 def get_handler(tool_name: str):
     """Return the async handler for a given tool name."""
-    handler = TOOL_REGISTRY.get(tool_name)
+    handler = _registry_with_finish().get(tool_name)
     if handler is None:
         raise ValueError(f"Unknown tool: {tool_name}")
     return handler
@@ -78,15 +122,25 @@ def _build_instruction(signature: dspy.Signature, tools: dict[str, Tool]) -> str
     for idx, tool in enumerate(tools.values()):
         instr.append(f"({idx + 1}) {tool}")
     instr.append("When providing `next_tool_args`, the value inside the field must be in JSON format")
+    instr.append("Tool use examples:")
+    for name, spec in _tool_specs_with_finish().items():
+        instr.append(
+            f"- {name}: description={spec.description}; args={json.dumps(spec.args, ensure_ascii=True)}; "
+            f"input_examples={json.dumps(spec.examples, ensure_ascii=True)}"
+        )
     return "\n".join(instr)
 
 
 @lru_cache(maxsize=1)
 def _build_react_modules() -> tuple[dict[str, Tool], Any, Any]:
-    tools = {"get_ip_address": Tool(get_ip_address)}
-    tools["finish"] = Tool(
+    tools = {
+        name: (tool if isinstance(tool, Tool) else Tool(tool))
+        for name, tool in _registry_with_finish().items()
+        if name != FINISH_TOOL_NAME
+    }
+    tools[FINISH_TOOL_NAME] = Tool(
         func=finish,
-        name="finish",
+        name=FINISH_TOOL_NAME,
         desc="Marks the task as complete and signals that all required output fields are available.",
         args={},
     )
@@ -183,15 +237,27 @@ def _normalize_tool_name(tool_name: str) -> str:
         "ip": "get_ip_address",
         "get_ip": "get_ip_address",
         "ip_address": "get_ip_address",
-        "final": "finish",
-        "done": "finish",
+        "final": FINISH_TOOL_NAME,
+        "done": FINISH_TOOL_NAME,
     }
     return aliases.get(key, key)
 
 
+def _compact_observation(value: Any) -> str:
+    """Limit tool result size so trajectory stays focused and cost-efficient."""
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, ensure_ascii=True)
+    else:
+        text = str(value)
+    if len(text) <= MAX_OBSERVATION_CHARS:
+        return text
+    clipped = text[:MAX_OBSERVATION_CHARS]
+    return f"{clipped}... [truncated {len(text) - MAX_OBSERVATION_CHARS} chars]"
+
+
 def _tool_requires_args(tool_name: str) -> bool:
     """Return whether the tool handler requires arguments."""
-    handler = TOOL_REGISTRY.get(tool_name)
+    handler = _registry_with_finish().get(tool_name)
     if handler is None:
         return True
     return len(inspect.signature(handler).parameters) > 0
@@ -244,7 +310,7 @@ async def llm_plan_step(payload: dict[str, Any]) -> dict[str, Any]:
     raw_args = getattr(pred, "next_tool_args", {})
     tool_args = _to_dict_like(raw_args)
 
-    if tool_name == "finish":
+    if tool_name == FINISH_TOOL_NAME:
         return {
             "type": "final",
             "thought": thought,
@@ -253,7 +319,7 @@ async def llm_plan_step(payload: dict[str, Any]) -> dict[str, Any]:
 
     # Back-compat if planner still emits legacy shape in args.
     tool_args = _normalize_tool_args({"args": tool_args, "input": tool_args.get("input")})
-    if tool_name not in TOOL_REGISTRY:
+    if tool_name not in _registry_with_finish():
         return {
             "type": "final",
             "thought": "Tool request invalid; finishing safely.",
@@ -317,7 +383,7 @@ async def dynamic_tool_activity(args: Sequence[RawValue]) -> dict[str, Any]:
         return {
             "tool": tool_name,
             "input": tool_args,
-            "output": result,
+            "output": _compact_observation(result),
             "is_error": False,
         }
     except Exception as exc:  # pragma: no cover
