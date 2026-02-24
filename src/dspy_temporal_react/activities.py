@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import ast
 import inspect
 import json
 import logging
 import os
+import operator
+import sys
+import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,6 +29,8 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 MAX_OBSERVATION_CHARS = int(os.getenv("MAX_OBSERVATION_CHARS", "1200"))
 FINISH_TOOL_NAME = "finish"
+PY_SANDBOX_TIMEOUT_SECONDS = int(os.getenv("PY_SANDBOX_TIMEOUT_SECONDS", "5"))
+PY_SANDBOX_MAX_OUTPUT_CHARS = int(os.getenv("PY_SANDBOX_MAX_OUTPUT_CHARS", "4000"))
 
 
 def _build_lm() -> dspy.LM:
@@ -44,6 +51,187 @@ async def get_ip_address() -> str:
         return response.text.strip()
 
 
+async def get_weather(city: str) -> str:
+    """Get weather for a city with provider fallback."""
+    city = city.strip()
+    if not city:
+        raise ValueError("city is required")
+
+    async def from_wttr() -> str:
+        url = f"https://wttr.in/{city}"
+        params = {"format": "j1"}
+        timeout = httpx.Timeout(10.0, connect=5.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+
+        current = (data.get("current_condition") or [{}])[0]
+        weather_days = data.get("weather") or []
+        today = weather_days[0] if len(weather_days) >= 1 else {}
+        tomorrow = weather_days[1] if len(weather_days) >= 2 else {}
+        today_low = today.get("mintempC", "unknown")
+        today_high = today.get("maxtempC", "unknown")
+        tomorrow_temp = tomorrow.get("avgtempC", "unknown")
+        desc = ((current.get("weatherDesc") or [{}])[0]).get("value", "unknown")
+        return (
+            f"Weather in {city} (source=wttr.in): condition={desc}; "
+            f"today_low_c={today_low}; today_high_c={today_high}; tomorrow_temp_c={tomorrow_temp}."
+        )
+
+    async def from_open_meteo() -> str:
+        timeout = httpx.Timeout(12.0, connect=5.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            geo = await client.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={"name": city, "count": 1, "language": "en", "format": "json"},
+            )
+            geo.raise_for_status()
+            geo_data = geo.json()
+            results = geo_data.get("results") or []
+            if not results:
+                raise ValueError(f"No geocoding result for city: {city}")
+            first = results[0]
+            lat = first.get("latitude")
+            lon = first.get("longitude")
+            if lat is None or lon is None:
+                raise ValueError(f"Invalid geocoding coordinates for city: {city}")
+
+            forecast = await client.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": lat,
+                    "longitude": lon,
+                    "daily": "temperature_2m_max,temperature_2m_min",
+                    "forecast_days": 2,
+                    "timezone": "auto",
+                },
+            )
+            forecast.raise_for_status()
+            f_data = forecast.json()
+
+        daily = f_data.get("daily") or {}
+        maxes = daily.get("temperature_2m_max") or []
+        mins = daily.get("temperature_2m_min") or []
+        if len(maxes) < 2 or len(mins) < 2:
+            raise ValueError("Insufficient forecast data")
+
+        today_low = mins[0]
+        today_high = maxes[0]
+        tomorrow_temp = round((maxes[1] + mins[1]) / 2, 1)
+        return (
+            f"Weather in {city} (source=open-meteo): "
+            f"today_low_c={today_low}; today_high_c={today_high}; tomorrow_temp_c={tomorrow_temp}. "
+            f"tomorrow_temp_c is avg of tomorrow min/max."
+        )
+
+    errors: list[str] = []
+    for provider in (from_wttr, from_open_meteo):
+        try:
+            return await provider()
+        except Exception as exc:  # pragma: no cover
+            errors.append(f"{provider.__name__}: {type(exc).__name__}: {exc}")
+
+    raise RuntimeError("Weather providers failed: " + " | ".join(errors))
+
+
+def _eval_expr_node(node: ast.AST) -> float:
+    allowed_binops: dict[type[ast.AST], Any] = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+        ast.Mod: operator.mod,
+    }
+    allowed_unary: dict[type[ast.AST], Any] = {
+        ast.UAdd: operator.pos,
+        ast.USub: operator.neg,
+    }
+
+    if isinstance(node, ast.Expression):
+        return _eval_expr_node(node.body)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return float(node.value)
+    if isinstance(node, ast.BinOp) and type(node.op) in allowed_binops:
+        left = _eval_expr_node(node.left)
+        right = _eval_expr_node(node.right)
+        return float(allowed_binops[type(node.op)](left, right))
+    if isinstance(node, ast.UnaryOp) and type(node.op) in allowed_unary:
+        value = _eval_expr_node(node.operand)
+        return float(allowed_unary[type(node.op)](value))
+    raise ValueError("Unsupported expression. Use only numbers, + - * / % and parentheses.")
+
+
+async def calculator(expression: str) -> str:
+    """Evaluate arithmetic expression with + - * / % and parentheses."""
+    expression = expression.strip()
+    if not expression:
+        raise ValueError("expression is required")
+    try:
+        tree = ast.parse(expression, mode="eval")
+        result = _eval_expr_node(tree)
+    except ZeroDivisionError as exc:
+        raise ValueError("Division by zero is not allowed") from exc
+    except SyntaxError as exc:
+        raise ValueError("Invalid expression syntax") from exc
+    except ValueError:
+        raise
+    except Exception as exc:  # pragma: no cover
+        raise ValueError("Invalid expression") from exc
+
+    # Return compact numeric string; int if exact.
+    if result.is_integer():
+        return str(int(result))
+    return str(result)
+
+
+async def python_sandbox(code: str) -> str:
+    """Execute Python code in a constrained subprocess."""
+    code = code.strip()
+    if not code:
+        raise ValueError("code is required")
+
+    bootstrap = (
+        "import builtins,sys\n"
+        "blocked={'open','exec','eval','compile','input','help','breakpoint','__import__'}\n"
+        "for name in blocked:\n"
+        "    if hasattr(builtins,name):\n"
+        "        setattr(builtins,name,None)\n"
+    )
+    wrapped = f"{bootstrap}\n{code}\n"
+
+    with tempfile.TemporaryDirectory(prefix="react_sandbox_") as tmpdir:
+        script_path = Path(tmpdir) / "main.py"
+        script_path.write_text(wrapped, encoding="utf-8")
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-I",
+            str(script_path),
+            cwd=tmpdir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={"PYTHONIOENCODING": "utf-8"},
+        )
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=PY_SANDBOX_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return f"Sandbox timeout after {PY_SANDBOX_TIMEOUT_SECONDS}s."
+
+    stdout = stdout_b.decode("utf-8", errors="replace").strip()
+    stderr = stderr_b.decode("utf-8", errors="replace").strip()
+    combined = "\n".join([part for part in [stdout, stderr] if part]).strip()
+    if not combined:
+        combined = "(no output)"
+    if len(combined) > PY_SANDBOX_MAX_OUTPUT_CHARS:
+        combined = (
+            f"{combined[:PY_SANDBOX_MAX_OUTPUT_CHARS]}... "
+            f"[truncated {len(combined) - PY_SANDBOX_MAX_OUTPUT_CHARS} chars]"
+        )
+    return combined
+
+
 async def finish() -> str:
     """Signals that the agent has enough information to finalize the answer."""
     return "Completed."
@@ -51,6 +239,9 @@ async def finish() -> str:
 
 TOOL_REGISTRY = {
     "get_ip_address": get_ip_address,
+    "get_weather": get_weather,
+    "calculator": calculator,
+    "python_sandbox": python_sandbox,
     FINISH_TOOL_NAME: finish,
 }
 
@@ -69,6 +260,24 @@ TOOL_SPECS: dict[str, ToolSpec] = {
         description="Get the machine public IP address.",
         args={},
         examples=[{}],
+    ),
+    "get_weather": ToolSpec(
+        name="get_weather",
+        description="Get current weather conditions for a city.",
+        args={"city": "string"},
+        examples=[{"city": "San Francisco"}, {"city": "Bengaluru"}],
+    ),
+    "python_sandbox": ToolSpec(
+        name="python_sandbox",
+        description="Run short Python snippets in a constrained subprocess and return stdout/stderr.",
+        args={"code": "string"},
+        examples=[{"code": "print(2 + 2)"}, {"code": "nums=[2,3,5];print(sum(nums))"}],
+    ),
+    "calculator": ToolSpec(
+        name="calculator",
+        description="Evaluate arithmetic expressions with + - * / % and parentheses.",
+        args={"expression": "string"},
+        examples=[{"expression": "(19 * 7) - 22"}, {"expression": "(28 / 2) + 11"}],
     ),
     FINISH_TOOL_NAME: ToolSpec(
         name=FINISH_TOOL_NAME,
@@ -175,7 +384,7 @@ def _scratchpad_to_trajectory(scratchpad: list[dict[str, Any]]) -> dict[str, Any
                 args = plan.get("args", {})
                 trajectory[f"tool_args_{idx}"] = args if isinstance(args, dict) else _to_dict_like(args)
             elif plan.get("type") == "final":
-                trajectory[f"tool_name_{idx}"] = "finish"
+                trajectory[f"tool_name_{idx}"] = FINISH_TOOL_NAME
                 trajectory[f"tool_args_{idx}"] = {}
         elif phase == "tool":
             trajectory[f"observation_{idx}"] = step.get("output", "")
@@ -237,6 +446,14 @@ def _normalize_tool_name(tool_name: str) -> str:
         "ip": "get_ip_address",
         "get_ip": "get_ip_address",
         "ip_address": "get_ip_address",
+        "weather": "get_weather",
+        "get_weather_by_city": "get_weather",
+        "python": "python_sandbox",
+        "run_python": "python_sandbox",
+        "python_exec": "python_sandbox",
+        "calc": "calculator",
+        "calculate": "calculator",
+        "math": "calculator",
         "final": FINISH_TOOL_NAME,
         "done": FINISH_TOOL_NAME,
     }
